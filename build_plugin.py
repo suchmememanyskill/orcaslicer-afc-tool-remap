@@ -14,7 +14,7 @@ import zipfile
 
 
 def build(output_dir):
-    source = Path(__file__).parent
+    source = Path(__file__).resolve().parent / "plugin"
     code = (source / "afc_pre_send.py").read_bytes()
     version = re.search(rb'^# version = "([^"]+)"$', code, re.MULTILINE)[1].decode()
     info = f"afc_tool_remap-{version}.dist-info"

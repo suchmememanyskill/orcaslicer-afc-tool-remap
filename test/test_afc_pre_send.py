@@ -14,6 +14,9 @@ import importlib.util
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "plugin"))
 import afc_pre_send as afc
 
 
