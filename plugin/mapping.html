@@ -433,14 +433,14 @@ const rows=job.filaments.map(f=>{
 });
 function chosen(row){return lanes.find(l=>l.name===row.selection);}
 function remainingText(lane){return lane.material.trim()&&typeof lane.remaining_grams==='number'&&Number.isFinite(lane.remaining_grams)&&lane.remaining_grams>=0?' · '+Math.round(lane.remaining_grams)+' g left':'';}
-function laneText(lane,withWeight=false){const text=el('span','selected');text.append(el('div','lane-name',lane?lane.name:(['loading','permission'].includes(phase)?'Reading lanes…':'Choose lane')),el('div','lane-sub',lane?(lane.material.trim()||'Empty lane')+(withWeight?remainingText(lane):''):(['loading','permission'].includes(phase)?'':'Not assigned')));return text;}
+function laneText(lane,withWeight=false){const text=el('span','selected');text.append(el('div','lane-name',lane?lane.name:(['loading','network_permission'].includes(phase)?'Reading lanes…':'Choose lane')),el('div','lane-sub',lane?(lane.material.trim()||'Empty lane')+(withWeight?remainingText(lane):''):(['loading','network_permission'].includes(phase)?'':'Not assigned')));return text;}
 function positionMenu(r){const box=r.summary.getBoundingClientRect(),spaceBelow=Math.min(window.innerHeight-12,document.querySelector('#afc footer').getBoundingClientRect().top-8)-box.bottom,spaceAbove=box.top-12,width=Math.min(Math.max(box.width,260),window.innerWidth-24);r.menu.style.width=width+'px';const above=spaceBelow<Math.min(r.menu.scrollHeight,280)&&spaceAbove>spaceBelow;r.menu.style.maxHeight=Math.max(40,Math.min(280,above?spaceAbove:spaceBelow))+'px';r.menu.style.left=Math.max(12,Math.min(box.right-width,window.innerWidth-width-12))+'px';r.menu.style.top=(above?box.top-r.menu.getBoundingClientRect().height-4:box.bottom+4)+'px';}
 function alignHeaders(){const list=document.getElementById('filaments');document.querySelector('.column-labels').style.paddingRight=(list.offsetWidth-list.clientWidth)+'px';}
 window.addEventListener('resize',alignHeaders);
 window.addEventListener('resize',()=>rows.forEach(r=>{if(r.dropdown.open)positionMenu(r);}));
 document.getElementById('filaments').addEventListener('scroll',()=>rows.forEach(r=>r.dropdown.open=false));
 function render(){
- let valid=phase==='ready',issue='';const selected=rows.map(r=>r.selection),loading=phase==='loading'||(phase==='permission'&&!lanes.length);
+ let valid=phase==='ready',issue='';const selected=rows.map(r=>r.selection),loading=phase==='loading'||(phase==='network_permission'&&!lanes.length);
  rows.forEach(r=>{
   const lane=chosen(r),empty=!lane||!lane.material.trim(),mismatch=!empty&&lane.material.trim().toUpperCase()!==r.f.material.trim().toUpperCase(),duplicate=!!lane&&selected.filter(n=>n===lane.name).length>1;
   const kind=empty||duplicate?'invalid':mismatch?'warning':'ok';
@@ -455,34 +455,30 @@ function render(){
  });
  alignHeaders();
  apply.disabled=!valid;
- refresh.disabled=['loading','refreshing','applying'].includes(phase)||(writeAttempted&&phase!=='permission');
+ refresh.disabled=['loading','refreshing','applying'].includes(phase)||writeAttempted;
  refresh.classList.toggle('spinning',phase==='loading'||phase==='refreshing');
  refresh.setAttribute('aria-busy',String(phase==='loading'||phase==='refreshing'));
  if(phase==='ready'){status.textContent=issue;status.className=issue?'warning':'';}
 }
-let permissionToken=null;
-function clearPermissionRetry(){permissionToken=null;}
 window.orca.onMessage(message=>{
- if(message.kind!=='permission')clearPermissionRetry();
  if(message.kind==='lanes'){
   lanes=message.lanes;rows.forEach(r=>{const current=lanes.find(l=>l.tool===r.f.tool);if(r.selection===null)r.selection=current?current.name:null;});phase='ready';render();
- }else if(message.kind==='permission'){
-  writeAttempted=!!message.mapping_write_attempted;phase='permission';render();skip.disabled=writeAttempted;
-  status.className='';status.textContent='Approve access in Orca’s permission prompt, then click Refresh to retry this read.';
-  permissionToken=message.token;
+ }else if(message.kind==='network_permission'){
+  phase='network_permission';writeAttempted=false;render();skip.disabled=false;
+  status.textContent=message.text;status.className='';
  }else if(message.kind==='error'){
   writeAttempted=!!message.mapping_write_attempted;phase='error';render();status.textContent=message.text;status.className='error';skip.disabled=!!message.mapping_write_attempted;
  }
 });
 refresh.onclick=()=>{
  if(refresh.disabled)return;
- const token=permissionToken;clearPermissionRetry();phase='refreshing';
+ phase='refreshing';
  rows.forEach(r=>r.dropdown.open=false);render();status.className='';
- status.textContent=token===null?'Refreshing AFC state…':'Retrying the permitted read…';
- window.orca.postMessage(token===null?{action:'refresh'}:{action:'permission_retry',token});
+ status.textContent='Refreshing AFC state…';
+ window.orca.postMessage({action:'refresh'});
 };
 apply.onclick=()=>{if(apply.disabled)return;phase='applying';rows.forEach(r=>r.dropdown.open=false);render();skip.disabled=true;status.className='';status.textContent='Applying and verifying lane mapping…';window.orca.postMessage({action:'apply',selection:Object.fromEntries(rows.map(r=>[String(r.f.tool),r.selection]))});};
-skip.onclick=()=>{if(skip.disabled)return;clearPermissionRetry();skip.disabled=true;apply.disabled=true;window.orca.postMessage({action:'skip'});};
+skip.onclick=()=>{if(skip.disabled)return;skip.disabled=true;apply.disabled=true;window.orca.postMessage({action:'skip'});};
 document.getElementById('cancel').onclick=()=>window.orca.close();
 for(const event of ['mouseenter','focus'])skip.addEventListener(event,()=>{if(!skip.disabled&&phase==='ready')status.textContent='Continue with the printer’s current mapping.';});
 for(const event of ['mouseleave','blur'])skip.addEventListener(event,()=>{if(phase==='ready')render();});

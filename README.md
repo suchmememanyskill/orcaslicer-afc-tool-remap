@@ -12,6 +12,8 @@ The mapping window shows the print preview, estimated time, filament usage and s
 - **Skip mapping** continues with the printer's current mapping without changing it.
 - **Cancel** stops the send.
 
+The plugin requests host-wide network access using the configured printer’s canonical URL (for example, `http://192.0.2.1`, without a path or port) before loading AFC state. Orca saves this grant for subsequent requests. If this first attempt is blocked while the permission prompt is open, approve access and click **Refresh** to load the state.
+
 Mapping changes persist on the printer. The plugin supports one-to-one tool-to-lane assignments and leaves G-code unchanged. Disk exports and sends through other printer hosts are unaffected.
 
 When used with **Compact G-code Tools**, run compaction first so the mapping window shows the final outgoing tool numbers.

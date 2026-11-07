@@ -8,7 +8,7 @@ import zipfile
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.request import ProxyHandler
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 import sys
 import importlib.util
 import unittest
@@ -411,171 +411,58 @@ class Tests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "verification"):
                     client.apply(lanes, {0: "laneA"})
 
-    def test_audit_permission_read_retries_once_after_callback(self):
-        denial = PermissionError('Plugin attempted audited operation "urllib.Request" without permission: audit permission required')
-        for wrapped in (False, True):
-            client = afc.Moonraker("http://unused.invalid")
-            client.retry_permission = Mock(return_value=True)
-            failure = afc.URLError(denial) if wrapped else denial
-            with patch.object(client.opener, "open", side_effect=[failure, io.BytesIO(b'{"result":"ok"}')]) as request:
-                self.assertEqual(client.request("/printer/objects/query?AFC"), {"result":"ok"})
-            self.assertEqual(request.call_count, 2)
-            client.retry_permission.assert_called_once()
-
-    def test_permission_retry_is_bounded(self):
-        denial = PermissionError('Plugin attempted audited operation "urllib.Request" without permission: audit permission required')
-        client = afc.Moonraker("http://unused.invalid")
-        client.retry_permission = Mock(return_value=True)
-        with patch.object(client.opener, "open", side_effect=denial) as request:
-            with self.assertRaises(PermissionError):
-                client.request("/printer/objects/query?AFC")
-        self.assertEqual(request.call_count, 2)
-        client.retry_permission.assert_called_once()
-
-    def test_permission_retry_never_resubmits_mapping_post(self):
-        denial = PermissionError('Plugin attempted audited operation "urllib.Request" without permission: audit permission required')
-        client = afc.Moonraker("http://unused.invalid")
-        client.retry_permission = Mock(return_value=True)
-        with patch.object(client.opener, "open", side_effect=denial) as request:
-            with self.assertRaises(PermissionError):
-                client.request("/printer/gcode/script", {"script":"SET_MAP LANE=laneA MAP=T0"})
-        request.assert_called_once()
-        client.retry_permission.assert_not_called()
-
-    def test_unrelated_errors_and_cancelled_permission_wait_are_not_retried(self):
-        client = afc.Moonraker("http://unused.invalid")
-        for failure in (afc.URLError("timed out"), PermissionError("filesystem permission denied")):
-            client.retry_permission = Mock(return_value=True)
-            with patch.object(client.opener, "open", side_effect=failure) as request:
-                with self.assertRaises(type(failure)):
-                    client.request("/printer/objects/query?AFC")
-            request.assert_called_once()
-            client.retry_permission.assert_not_called()
-        client.retry_permission = Mock(return_value=False)
-        denial = PermissionError('Plugin attempted audited operation "urllib.Request" without permission: audit permission required')
-        with patch.object(client.opener, "open", side_effect=denial) as request:
-            with self.assertRaises(PermissionError):
-                client.request("/printer/objects/query?AFC")
-        request.assert_called_once()
-
-    def test_permission_prompt_retry_and_skip_in_same_dialog(self):
+    def test_initial_host_permission_can_retry_or_skip_without_reads(self):
         for skip in (False, True):
             client = Mock(mapping_write_attempted=False)
-            client.fetch.return_value = afc.parse_lanes(*fixture())
+            client.request_network_access.side_effect = [PermissionError("pending"), PermissionError("still pending"), None]
+            client.fetch.return_value = []
             window = types.SimpleNamespace(is_open=lambda: True)
             window.close = lambda: setattr(window, "is_open", lambda: False)
-            kinds = []
+            notices = []
             def create_window(**kwargs):
                 def post(message):
-                    kinds.append(message["kind"])
-                    if message["kind"] == "permission":
-                        kwargs["on_message"]({"action":"skip"} if skip else
-                                             {"action":"permission_retry", "token":message["token"]})
+                    notices.append(message["kind"])
+                    if message["kind"] == "network_permission":
+                        client.fetch.assert_not_called()
+                        client.ensure_idle.assert_not_called()
+                        client.apply.assert_not_called()
+                        if skip:
+                            kwargs["on_message"]({"action": "skip"})
+                        else:
+                            kwargs["on_message"]({"action": "refresh"})
                     elif message["kind"] == "lanes":
-                        kwargs["on_close"]()
+                        kwargs["on_message"]({"action": "skip"})
                 window.post = post
-                kwargs["on_message"]({"action":"ready"})
+                kwargs["on_message"]({"action": "ready"})
                 return window
-            def ensure_idle():
-                if not client.retry_permission():
-                    raise PermissionError("permission wait ended")
-            client.ensure_idle.side_effect = ensure_idle
             ctx = types.SimpleNamespace(output_name="test.gcode", gcode_path="unused", config_value=lambda key: None,
                                         cancelled=lambda: False)
             ui = types.SimpleNamespace(WINDOW_MODAL=1, create_window=create_window)
             with patch.object(afc, "project_filaments", return_value=[]), patch.object(afc, "connection", return_value=client):
-                if skip:
-                    self.assertEqual(afc.run_mapping(ctx,ui,threading.Event()), "skipped")
-                    client.fetch.assert_not_called()
-                else:
-                    with self.assertRaisesRegex(ValueError,"closed"):
-                        afc.run_mapping(ctx,ui,threading.Event())
-                    self.assertEqual(kinds,["permission","lanes"])
+                self.assertEqual(afc.run_mapping(ctx, ui, threading.Event()), "skipped")
+            self.assertEqual(notices, ["network_permission"] if skip else ["network_permission", "network_permission", "lanes"])
+            self.assertEqual(client.request_network_access.call_count, 1 if skip else 3)
+            self.assertEqual(client.fetch.call_count, 0 if skip else 1)
             client.apply.assert_not_called()
-            self.assertIsNone(client.retry_permission)
 
-    def test_permission_wait_ignores_stale_and_unscoped_retry_events(self):
-        client = Mock(mapping_write_attempted=False)
-        window = types.SimpleNamespace(is_open=lambda: True)
-        window.close = lambda: setattr(window, "is_open", lambda: False)
-        def create_window(**kwargs):
-            def post(message):
-                if message["kind"] == "permission":
-                    kwargs["on_message"]({"action":"permission_retry","token":message["token"]-1})
-                    kwargs["on_message"]({"action":"refresh"})
-                    kwargs["on_message"]({"action":"skip"})
-                else:
-                    kwargs["on_close"]()
-            window.post = post
-            kwargs["on_message"]({"action":"ready"})
-            return window
-        def ensure_idle():
-            if not client.retry_permission():
-                raise PermissionError("permission wait ended")
-        client.ensure_idle.side_effect = ensure_idle
-        ctx = types.SimpleNamespace(output_name="test.gcode",gcode_path="unused",config_value=lambda key:None,
-                                    cancelled=lambda:False)
-        ui = types.SimpleNamespace(WINDOW_MODAL=1,create_window=create_window)
-        with patch.object(afc,"project_filaments",return_value=[]),patch.object(afc,"connection",return_value=client):
-            self.assertEqual(afc.run_mapping(ctx,ui,threading.Event()),"skipped")
-        client.fetch.assert_not_called()
-        client.apply.assert_not_called()
+    def test_network_access_requests_canonical_host_url(self):
+        for address, origin in (("http://192.0.2.1", "http://192.0.2.1"),
+                                 ("https://printer.local:7125/base", "https://printer.local"),
+                                 ("http://[::1]:7125/base", "http://[::1]")):
+            client = afc.Moonraker(address)
+            with patch("sys.audit") as audit, patch.object(client.opener, "open") as request:
+                client.request_network_access()
+            audit.assert_called_once_with("urllib.Request", origin, None, {}, "GET")
+            request.assert_not_called()
 
-    def test_mapping_post_audit_denial_restores_no_write_state(self):
-        denial = PermissionError('Plugin attempted audited operation "urllib.Request" without permission: audit permission required')
-        lanes = afc.parse_lanes(*fixture())
-        for wrapped in (False, True):
-            client = afc.Moonraker("http://unused.invalid")
-            failure = afc.URLError(denial) if wrapped else denial
-            with patch.object(client,"ensure_idle"), patch.object(client,"fetch",return_value=lanes), patch.object(client,"request",side_effect=failure) as request:
-                with self.assertRaisesRegex(ValueError,"before it was sent"):
-                    client.apply(lanes,{0:"laneA"})
-            self.assertFalse(client.mapping_write_attempted)
-            request.assert_called_once()
-
-    def test_uncertain_mapping_failure_and_prior_write_stay_uncertain(self):
-        lanes = afc.parse_lanes(*fixture())
-        late = PermissionError('Plugin attempted audited operation "http.client.send" without permission: audit permission required')
-        early = PermissionError('Plugin attempted audited operation "urllib.Request" without permission: audit permission required')
-        for failure, prior in ((afc.URLError("timed out"),False),(late,False),(early,True)):
-            client = afc.Moonraker("http://unused.invalid")
-            client.mapping_write_attempted = prior
-            with patch.object(client,"ensure_idle"), patch.object(client,"fetch",return_value=lanes), patch.object(client,"request",side_effect=failure) as request:
-                with self.assertRaises(ValueError if prior else type(failure)):
-                    client.apply(lanes,{0:"laneA"})
-            self.assertTrue(client.mapping_write_attempted)
-            request.assert_called_once()
-
-    def test_permission_blocked_post_can_recover_with_refresh_and_manual_apply(self):
-        lanes = afc.parse_lanes(*fixture())
-        readback = fixture()[3]
-        readback["result"]["status"]["AFC_stepper laneA"]["map"] = ["T0"]
-        readback["result"]["status"]["AFC_stepper laneB"]["map"] = ["T2"]
-        denial = PermissionError('Plugin attempted audited operation "urllib.Request" without permission: audit permission required')
-        client = afc.Moonraker("http://unused.invalid")
-        window = types.SimpleNamespace(is_open=lambda:True)
-        window.close = lambda:setattr(window,"is_open",lambda:False)
-        kinds = []
-        def create_window(**kwargs):
-            def post(message):
-                kinds.append(message["kind"])
-                if message["kind"] == "error":
-                    self.assertFalse(message["mapping_write_attempted"])
-                    self.assertIn("No mapping commands were sent",message["text"])
-                    kwargs["on_message"]({"action":"refresh"})
-                else:
-                    kwargs["on_message"]({"action":"apply","selection":{"0":"laneA"}})
-            window.post = post
-            kwargs["on_message"]({"action":"ready"})
-            return window
-        ctx = types.SimpleNamespace(output_name="test.gcode",gcode_path="unused",config_value=lambda key:None,
-                                    cancelled=lambda:False)
-        ui = types.SimpleNamespace(WINDOW_MODAL=1,create_window=create_window)
-        with patch.object(afc,"project_filaments",return_value=[{"tool":0,"material":"PLA","color":""}]), patch.object(afc,"connection",return_value=client), patch.object(client,"ensure_idle"), patch.object(client,"fetch",return_value=lanes), patch.object(client,"request",side_effect=[denial,{"result":"ok"}]) as request, patch.object(client,"query_lane_maps",return_value=readback) as verify:
-            self.assertEqual(afc.run_mapping(ctx,ui,threading.Event()),"applied")
-        self.assertEqual(kinds,["lanes","error","lanes"])
-        self.assertEqual(request.call_count,2)  # blocked attempt, then explicit second Apply
-        verify.assert_called_once()
+    def test_request_errors_are_propagated_without_retries(self):
+        for payload in (None, {"script": "SET_MAP LANE=laneA MAP=T0"}):
+            for error in (PermissionError("denied"), URLError("timeout")):
+                client = afc.Moonraker("http://unused.invalid")
+                with patch.object(client.opener, "open", side_effect=error) as request:
+                    with self.assertRaises(type(error)):
+                        client.request("/printer/gcode/script", payload)
+                request.assert_called_once()
 
     def test_post_redirect_is_not_followed(self):
         calls = []

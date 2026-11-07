@@ -4,7 +4,7 @@
 # name = "AFC tool remap"
 # description = "Review physical AFC lane assignments before Orca uploads G-code."
 # author = "Sims"
-# version = "0.3.13"
+# version = "0.3.18"
 # type = "slicing-pipeline"
 # ///
 """Orca 2.5 experimental AFC tool remap mapping. No uploader or G-code edits.
@@ -17,12 +17,12 @@ import csv
 import math
 from pathlib import Path
 import queue
+import sys
 import threading
 import json
 import re
 import struct
 import time
-from urllib.error import URLError
 from urllib.parse import quote, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
@@ -118,18 +118,9 @@ def plan(lanes, selections):
     return commands, after
 
 
-def audit_permission_event(error):
-    denial = error.reason if isinstance(error, URLError) else error
-    if not isinstance(denial, PermissionError):
-        return None
-    match = re.fullmatch(r'Plugin attempted audited operation "([^"\n]+)" without permission: audit permission required', str(denial))
-    return match[1] if match else None
-
-
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        # Keep urllib.Request audit denials attributable to the initial request,
-        # never to a redirect after the original POST may have been executed.
+        # Keep mapping commands on the configured printer endpoint.
         return None
 
 
@@ -140,31 +131,26 @@ class Moonraker:
             self.address = "http://" + self.address
         self.api_key = api_key
         self.mapping_write_attempted = False
-        self.retry_permission = None
         self.opener = build_opener(NoRedirect())
+
+    def request_network_access(self):
+        # Orca matches HTTP URLs only against a canonical scheme://host
+        # grant. A bare IP grant covers connection events but not URL events.
+        # Paths, ports and wildcards would prevent the host-wide URL match.
+        address = urlsplit(self.address)
+        host = address.hostname
+        if ":" in host:
+            host = "[" + host + "]"
+        origin = urlunsplit((address.scheme, host, "", "", ""))
+        sys.audit("urllib.Request", origin, None, {}, "GET")
 
     def request(self, path, payload=None):
         headers = {"X-Api-Key": self.api_key} if self.api_key else {}
         data = None if payload is None else json.dumps(payload).encode()
         if data is not None:
             headers["Content-Type"] = "application/json"
-        retried = set()
-        while True:
-            try:
-                with self.opener.open(Request(self.address + path, data=data, headers=headers), timeout=5) as response:
-                    result = json.load(response)
-                break
-            except (PermissionError, URLError) as error:
-                # Orca queues its modal prompt and rejects this worker operation.
-                # Retry only audited reads, once per distinct denial in this GET.
-                # A POST may already have run: never resubmit mapping commands.
-                reason = audit_permission_event(error)
-                if (payload is not None or reason is None or reason in retried or
-                        self.retry_permission is None):
-                    raise
-                retried.add(reason)
-                if not self.retry_permission():
-                    raise
+        with self.opener.open(Request(self.address + path, data=data, headers=headers), timeout=5) as response:
+            result = json.load(response)
         if "error" in result:
             raise ValueError("Moonraker returned an error")
         return result
@@ -200,18 +186,9 @@ class Moonraker:
         if cancelled():
             raise ValueError("Send cancelled before applying mapping")
         if commands:
-            previous_write = self.mapping_write_attempted
+            payload = {"script": "\n".join(commands)}
             self.mapping_write_attempted = True
-            try:
-                self.request("/printer/gcode/script", {"script": "\n".join(commands)})
-            except (PermissionError, URLError) as error:
-                # CPython raises this audit event before OpenerDirector._open:
-                # no network request has been sent. Later errors stay uncertain.
-                if audit_permission_event(error) == "urllib.Request":
-                    self.mapping_write_attempted = previous_write
-                    raise ValueError("Orca blocked the mapping request before it was sent. "
-                                     "Approve permission, then Refresh and Apply again.") from error
-                raise
+            self.request("/printer/gcode/script", payload)
         for attempt in range(6):
             if cancelled():
                 raise ValueError("Send cancelled; mapping may already have changed")
@@ -368,37 +345,26 @@ def run_mapping(ctx, ui, stopped):
                               on_message=on_message, on_close=closed.set)
     lanes = None
     last_error = None
+    network_authorized = False
+    def authorize_network():
+        nonlocal network_authorized, last_error
+        if network_authorized:
+            return True
+        try:
+            client.request_network_access()
+        except PermissionError:
+            # Only the initial host grant has a permission recovery state.
+            # Orca posts its native prompt asynchronously on this worker.
+            last_error = {"kind": "network_permission",
+                          "text": "Approve printer network access in Orca’s prompt, then click Refresh to continue."}
+            window.post(last_error)
+            return False
+        network_authorized = True
+        last_error = None
+        return True
+
     def cancelled():
         return closed.is_set() or stopped.is_set() or ctx.cancelled()
-    skip_requested = False
-    permission_counter = 0
-    def wait_for_permission():
-        nonlocal skip_requested, permission_counter
-        permission_counter += 1
-        token = permission_counter
-        notice = {"kind": "permission", "token": token,
-                  "mapping_write_attempted": client.mapping_write_attempted}
-        window.post(notice)
-        deadline = time.monotonic() + 60
-        while not cancelled() and window.is_open():
-            if time.monotonic() >= deadline or time.monotonic() - last_heartbeat[0] > 20:
-                return False
-            try:
-                reply = messages.get(timeout=0.15)
-            except queue.Empty:
-                continue
-            if not isinstance(reply, dict):
-                continue
-            action = reply.get("action")
-            if action == "permission_retry" and reply.get("token") == token:
-                return True
-            if action == "skip" and not client.mapping_write_attempted:
-                skip_requested = True
-                return False
-            if action == "ready":
-                window.post(notice)
-        return False
-    client.retry_permission = wait_for_permission
     try:
         while not cancelled():
             if time.monotonic() - last_heartbeat[0] > 20:
@@ -416,6 +382,9 @@ def run_mapping(ctx, ui, stopped):
                 if action == "skip" and not client.mapping_write_attempted:
                     return "skipped"
                 if action == "refresh" and not client.mapping_write_attempted:
+                    if not authorize_network():
+                        continue
+                    client.ensure_idle()
                     lanes = client.fetch()
                     last_error = None
                     window.post({"kind": "lanes", "lanes": lanes})
@@ -424,6 +393,8 @@ def run_mapping(ctx, ui, stopped):
                         window.post(last_error)
                     else:
                         if lanes is None:
+                            if not authorize_network():
+                                continue
                             client.ensure_idle()
                             lanes = client.fetch()
                         window.post({"kind": "lanes", "lanes": lanes})
@@ -435,8 +406,6 @@ def run_mapping(ctx, ui, stopped):
                     if not cancelled():
                         return "applied"
             except Exception as error:
-                if skip_requested:
-                    return "skipped"
                 consequence = ("Mapping may already have changed." if client.mapping_write_attempted
                                else "No mapping commands were sent.")
                 next_step = ("Cancel this send and reopen to try again." if client.mapping_write_attempted else
@@ -446,7 +415,6 @@ def run_mapping(ctx, ui, stopped):
                 window.post(last_error)
         raise ValueError("AFC mapping closed without applying; send cancelled")
     finally:
-        client.retry_permission = None
         window.close()
         # Modal destruction is deferred. Bound this wait so a GUI joining this
         # worker cannot leave both waiting forever. Linux 2.5 is the test target.
