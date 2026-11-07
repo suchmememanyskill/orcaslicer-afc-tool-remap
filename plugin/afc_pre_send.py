@@ -3,7 +3,7 @@
 # [tool.orcaslicer.plugin]
 # name = "AFC tool remap"
 # description = "Review physical AFC lane assignments before Orca uploads G-code."
-# author = "Local"
+# author = "Sims"
 # version = "0.3.13"
 # type = "slicing-pipeline"
 # ///

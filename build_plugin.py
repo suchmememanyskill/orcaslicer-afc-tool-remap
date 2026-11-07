@@ -24,7 +24,7 @@ def build(output_dir):
         f"{info}/METADATA": (
             f"Metadata-Version: 2.1\nName: AFC-tool-remap\nVersion: {version}\n"
             "Summary: AFC physical lane mapping before Orca upload\n"
-            "Author: Local\nRequires-Python: >=3.12\n\n").encode(),
+            "Author: Sims\nRequires-Python: >=3.12\n\n").encode(),
         f"{info}/WHEEL": b"Wheel-Version: 1.0\nGenerator: afc-tool-remap\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
         f"{info}/top_level.txt": b"afc_pre_send\n",
     }
