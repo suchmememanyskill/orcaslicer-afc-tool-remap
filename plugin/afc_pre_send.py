@@ -34,12 +34,12 @@ def tool_number(value):
     return int(text.removeprefix("T"))
 
 
-def physical_lane_tools(names, response):
+def physical_lane_tools(objects, response):
     """Read each physical lane's mapping; AFC.maps is only a tool registry."""
     status = response["result"]["status"]
     current = {}
-    for name in names:
-        mappings = status["AFC_stepper " + name]["map"]
+    for name, obj in objects.items():
+        mappings = status[obj]["map"]
         if not isinstance(mappings, list) or len(mappings) != 1:
             raise ValueError(f"Physical lane {name} does not have a single tool mapping")
         current[name] = tool_number(mappings[0])
@@ -48,29 +48,46 @@ def physical_lane_tools(names, response):
     return current
 
 
-def parse_lanes(database, afc, units, lane_response):
-    """Join database metadata by mutable tool, never by database key."""
-    records = {}
-    for record in database["result"]["value"].values():
-        tool = tool_number(record["lane"])
-        if tool in records:
-            raise ValueError("Duplicate database tool")
-        records[tool] = record
+def discover_lane_objects(names, response):
+    """Resolve short lane names against Moonraker's registered objects."""
+    if not isinstance(names, list) or not names or any(not isinstance(name, str) or not name for name in names) or len(set(names)) != len(names):
+        raise ValueError("Invalid AFC lane names")
+    objects = response["result"]["objects"]
+    if not isinstance(objects, list) or any(not isinstance(obj, str) for obj in objects):
+        raise ValueError("Invalid printer object list")
+    resolved = {}
+    for name in names:
+        matches = [obj for obj in objects
+                   if obj.partition(" ")[0] in ("AFC_stepper", "AFC_lane")
+                   and obj.partition(" ")[2] == name]
+        if not matches:
+            raise ValueError(f"Missing AFC lane object for {name}")
+        resolved[name] = matches[0]
+    return resolved
+
+
+def parse_lanes(afc, units, lane_response, objects):
+    """Read metadata and mappings directly from physical lane status."""
     status = afc["result"]["status"]["AFC"]
     if status.get("multiple_tool_mapping", False):
         raise ValueError("Multiple tool mapping is enabled; this plugin currently supports one-to-one mapping only")
     names = status["lanes"]
     if not names or len(set(names)) != len(names):
         raise ValueError("Invalid AFC lane names")
-    current = physical_lane_tools(names, lane_response)
+    current = physical_lane_tools(objects, lane_response)
+    extruders = set()
     lanes = []
     for section in status["units"]:
         obj = "AFC_" + section
         for position, name in enumerate(units[obj]["result"]["status"][obj]["lanes"]):
             if name not in current or any(lane["name"] == name for lane in lanes):
                 raise ValueError("Invalid unit membership")
-            record = records.get(current[name], {})
-            if str(record.get("extruder_index", 0)) != "0":
+            record = lane_response["result"]["status"][objects[name]]
+            extruder = record.get("extruder")
+            if not isinstance(extruder, str) or not extruder.strip():
+                raise ValueError(f"Missing AFC extruder for physical lane {name}")
+            extruders.add(extruder)
+            if len(extruders) > 1:
                 raise ValueError("This plugin supports one physical extruder only")
             # AFC represents unassigned lane metadata as JSON null as well as
             # empty strings. Keep empty lanes visible, but not selectable.
@@ -85,7 +102,7 @@ def parse_lanes(database, afc, units, lane_response):
             weight = record.get("weight")
             remaining = (float(weight) if isinstance(weight, (int, float)) and not isinstance(weight, bool)
                          and math.isfinite(weight) and weight >= 0 else None)
-            lanes.append(dict(name=name, unit=section, position=position,
+            lanes.append(dict(name=name, object=objects[name], extruder=extruder, unit=section, position=position,
                               tool=current[name], remaining_grams=remaining, **metadata))
     if len(lanes) != len(names):
         raise ValueError("Incomplete unit membership")
@@ -158,18 +175,19 @@ class Moonraker:
     def query(self, obj):
         return self.request("/printer/objects/query?" + quote(obj, safe=""))
 
-    def query_lane_maps(self, names):
+    def query_lane_maps(self, objects):
         # Query all physical lane objects in one request, including their map lists.
         return self.request("/printer/objects/query?" + "&".join(
-            quote("AFC_stepper " + name, safe="") for name in names))
+            quote(obj, safe="") for obj in objects.values()))
 
     def fetch(self):
         afc = self.query("AFC")
+        objects = discover_lane_objects(afc["result"]["status"]["AFC"]["lanes"],
+                                        self.request("/printer/objects/list"))
         units = {"AFC_" + section: self.query("AFC_" + section)
                  for section in afc["result"]["status"]["AFC"]["units"]}
-        lane_response = self.query_lane_maps(afc["result"]["status"]["AFC"]["lanes"])
-        database = self.request("/server/database/item?namespace=lane_data")
-        return parse_lanes(database, afc, units, lane_response)
+        lane_response = self.query_lane_maps(objects)
+        return parse_lanes(afc, units, lane_response, objects)
 
     def ensure_idle(self):
         state = self.query("print_stats")["result"]["status"]["print_stats"]["state"]
@@ -192,8 +210,8 @@ class Moonraker:
         for attempt in range(6):
             if cancelled():
                 raise ValueError("Send cancelled; mapping may already have changed")
-            names = [lane["name"] for lane in fresh]
-            current = physical_lane_tools(names, self.query_lane_maps(names))
+            objects = {lane["name"]: lane["object"] for lane in fresh}
+            current = physical_lane_tools(objects, self.query_lane_maps(objects))
             actual = {tool: name for name, tool in current.items()}
             if actual == expected:
                 return

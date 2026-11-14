@@ -446,7 +446,7 @@ function render(){
   const kind=empty||duplicate?'invalid':mismatch?'warning':'ok';
   const hint=empty?'Select a populated lane':duplicate?'This lane is assigned more than once':mismatch?'Material mismatch: '+r.f.material+' → '+lane.material:'Material matches';
   if(kind==='invalid')valid=false;
-  if(kind!=='ok'&&!issue)issue='T'+r.f.tool+': '+hint;
+  if(kind==='invalid'&&!issue)issue='T'+r.f.tool+': '+hint;
   r.row.className='row '+(loading?'':kind);r.indicator.setAttribute('role','img');r.indicator.className='indicator '+(loading?'':kind);r.indicator.title=hint;r.indicator.setAttribute('aria-label',hint);r.indicator.replaceChildren(icon(loading?'swaps':kind==='ok'?'check':kind==='warning'?'warning':'x'));
   r.summary.replaceChildren(swatch(lane&&lane.color),laneText(lane),icon('chevron'));r.summary.lastChild.classList.add('chevron');r.summary.setAttribute('aria-label','T'+r.f.tool+' physical lane: '+(lane?lane.name+', '+(lane.material||'empty'):'not assigned'));if(!loading&&kind!=='ok')r.summary.querySelector('.lane-sub').textContent=duplicate?'Already assigned':empty?'Empty lane':r.f.material+' → '+lane.material+' · mismatch';
   r.summary.style.pointerEvents=phase==='ready'?'':'none';r.summary.setAttribute('aria-disabled',String(phase!=='ready'));r.summary.tabIndex=phase==='ready'?0:-1;

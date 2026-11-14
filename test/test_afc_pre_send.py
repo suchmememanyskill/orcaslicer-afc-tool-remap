@@ -21,17 +21,15 @@ import afc_pre_send as afc
 
 
 def fixture():
-    db = {"result": {"value": {
-        "unrelated-key-" + str(i): {"lane": str(i), "material": "PLA", "color": "#112233"}
-        for i in range(3)}}}
     status = {"units": ["BoxTurtle Turtle_1"], "lanes": ["laneA", "laneB", "laneC"],
               "maps": ["T2", "T0", "T1"]}
     obj = "AFC_BoxTurtle Turtle_1"
     units = {obj: {"result": {"status": {obj: {"lanes": ["laneA", "laneB", "laneC"]}}}}}
     lane_response = {"result": {"status": {
-        "AFC_stepper " + name: {"map": [tool]} for name, tool in
+        "AFC_stepper " + name: {"map": [tool], "material": "PLA", "color": "#112233", "extruder": "extruder"} for name, tool in
         zip(status["lanes"], ["T2", "T0", "T1"])}}}
-    return db, {"result": {"status": {"AFC": status}}}, units, lane_response
+    objects = {name: "AFC_stepper " + name for name in status["lanes"]}
+    return {"result": {"status": {"AFC": status}}}, units, lane_response, objects
 
 
 class Tests(unittest.TestCase):
@@ -41,26 +39,26 @@ class Tests(unittest.TestCase):
                          [("laneA", 2, 0), ("laneB", 0, 1), ("laneC", 1, 2)])
 
     def test_global_maps_registry_is_not_paired_with_physical_lanes(self):
-        database, response, units, lane_response = fixture()
+        response, units, lane_response, objects = fixture()
         # Global map keys may be in another order and include virtual tool names.
         response["result"]["status"]["AFC"]["maps"] = ["T0", "T1", "T2", "T99"]
-        for tool in range(3):
-            database["result"]["value"]["unrelated-key-"+str(tool)]["color"] = "#"+str(tool)*6
-        lanes = afc.parse_lanes(database, response, units, lane_response)
+        for name, tool in zip(objects, (2, 0, 1)):
+            lane_response["result"]["status"][objects[name]]["color"] = "#"+str(tool)*6
+        lanes = afc.parse_lanes(response, units, lane_response, objects)
         self.assertEqual([(lane["name"],lane["tool"],lane["color"]) for lane in lanes],
                          [("laneA",2,"#222222"),("laneB",0,"#000000"),("laneC",1,"#111111")])
 
     def test_multiple_mapping_mode_is_explicitly_unsupported(self):
-        database, response, units, lane_response = fixture()
+        response, units, lane_response, objects = fixture()
         response["result"]["status"]["AFC"]["multiple_tool_mapping"] = True
         with self.assertRaisesRegex(ValueError, "Multiple tool mapping is enabled"):
-            afc.parse_lanes(database,response,units,lane_response)
+            afc.parse_lanes(response,units,lane_response,objects)
 
     def test_empty_lane_null_metadata(self):
-        database, response, units, lane_response = fixture()
-        record = database["result"]["value"]["unrelated-key-2"]
+        response, units, lane_response, objects = fixture()
+        record = lane_response["result"]["status"][objects["laneA"]]
         record.update(material=None, color=None)
-        lanes = afc.parse_lanes(database, response, units, lane_response)
+        lanes = afc.parse_lanes(response, units, lane_response, objects)
         self.assertEqual(lanes[0]["name"], "laneA")
         self.assertEqual((lanes[0]["material"], lanes[0]["color"]), ("", ""))
         with self.assertRaisesRegex(ValueError, "no material"):
@@ -69,21 +67,21 @@ class Tests(unittest.TestCase):
         self.assertEqual(afc.plan(lanes, {0: "laneB"})[0], [])
         record["color"] = 123
         with self.assertRaisesRegex(ValueError, "color for physical lane laneA"):
-            afc.parse_lanes(database, response, units, lane_response)
+            afc.parse_lanes(response, units, lane_response, objects)
 
-    def test_remaining_weight_is_optional_and_joined_by_current_tool(self):
-        database, response, units, lane_response = fixture()
-        records = database["result"]["value"]
-        records["unrelated-key-2"]["weight"] = 984.67
-        lanes = afc.parse_lanes(database, response, units, lane_response)
+    def test_remaining_weight_is_optional_and_read_from_physical_lane(self):
+        response, units, lane_response, objects = fixture()
+        record = lane_response["result"]["status"][objects["laneA"]]
+        record["weight"] = 984.67
+        lanes = afc.parse_lanes(response, units, lane_response, objects)
         self.assertEqual(lanes[0]["name"], "laneA")
         self.assertEqual(lanes[0]["remaining_grams"], 984.67)
         self.assertIsNone(lanes[1]["remaining_grams"])
         for invalid in (None, -1, float("nan"), True, "unknown"):
-            records["unrelated-key-2"]["weight"] = invalid
-            self.assertIsNone(afc.parse_lanes(database, response, units, lane_response)[0]["remaining_grams"])
-        records["unrelated-key-2"]["weight"] = 0
-        self.assertEqual(afc.parse_lanes(database, response, units, lane_response)[0]["remaining_grams"], 0)
+            record["weight"] = invalid
+            self.assertIsNone(afc.parse_lanes(response, units, lane_response, objects)[0]["remaining_grams"])
+        record["weight"] = 0
+        self.assertEqual(afc.parse_lanes(response, units, lane_response, objects)[0]["remaining_grams"], 0)
 
     def test_wheel_bundles_template_and_renders_after_extraction(self):
         from build_plugin import build
@@ -134,26 +132,29 @@ class Tests(unittest.TestCase):
             afc.plan(lanes, {0: "laneA"})
 
     def test_fetch_encoded_units_and_apply_readback(self):
-        db, response, units, lane_response = fixture()
+        response, units, lane_response, objects = fixture()
+        # A unit may mix legacy steppers and lanes without their own stepper.
+        objects["laneB"] = "AFC_lane laneB"
+        lane_response["result"]["status"][objects["laneB"]] = lane_response["result"]["status"].pop("AFC_stepper laneB")
         calls = []
         status = response["result"]["status"]["AFC"]
         def request(path, payload=None):
             calls.append((path, payload))
-            if path == "/server/database/item?namespace=lane_data":
-                return db
+            if path == "/printer/objects/list":
+                return {"result": {"objects": list(objects.values())}}
             if path == "/printer/objects/query?print_stats":
                 return {"result": {"status": {"print_stats": {"state": "standby"}}}}
             if path == "/printer/objects/query?AFC":
                 return response
             if path == "/printer/objects/query?AFC_BoxTurtle%20Turtle_1":
                 return next(iter(units.values()))
-            if path == "/printer/objects/query?AFC_stepper%20laneA&AFC_stepper%20laneB&AFC_stepper%20laneC":
+            if path == "/printer/objects/query?AFC_stepper%20laneA&AFC_lane%20laneB&AFC_stepper%20laneC":
                 return lane_response
             if path == "/printer/gcode/script":
                 self.assertEqual(payload, {"script": "SET_MAP LANE=laneA MAP=T0"})
                 # Registry order remains unchanged even though the physical maps swap.
                 lane_response["result"]["status"]["AFC_stepper laneA"]["map"] = ["T0"]
-                lane_response["result"]["status"]["AFC_stepper laneB"]["map"] = ["T2"]
+                lane_response["result"]["status"]["AFC_lane laneB"]["map"] = ["T2"]
                 return {"result": "ok"}
             self.fail(path)
         client = afc.Moonraker("unused.invalid")
@@ -161,6 +162,39 @@ class Tests(unittest.TestCase):
             snapshot = client.fetch()
             client.apply(snapshot, {0: "laneA"})
         self.assertEqual(sum(p == "/printer/gcode/script" for p, _ in calls), 1)
+
+    def test_discovery_rejects_missing_and_malformed_objects(self):
+        for objects in (["unrelated laneA"],
+                        [None], "AFC_lane laneA"):
+            with self.subTest(objects=objects), self.assertRaises(ValueError):
+                afc.discover_lane_objects(["laneA"], {"result": {"objects": objects}})
+        self.assertEqual(afc.discover_lane_objects(["laneA"], {"result": {"objects": [
+            "AFC_lane laneA", "AFC_stepper laneAB", "filament_switch_sensor laneA"]}}),
+            {"laneA": "AFC_lane laneA"})
+
+    def test_discovery_uses_first_registered_lane_alias(self):
+        for aliases in (["AFC_stepper laneA", "AFC_lane laneA"],
+                        ["AFC_lane laneA", "AFC_stepper laneA"]):
+            self.assertEqual(afc.discover_lane_objects(["laneA"],
+                {"result": {"objects": aliases}}), {"laneA": aliases[0]})
+
+    def test_live_extruder_relationship_must_be_known_and_single(self):
+        for extruder in (None, "", "extruder1"):
+            response, units, lane_response, objects = fixture()
+            lane_response["result"]["status"][objects["laneB"]]["extruder"] = extruder
+            with self.subTest(extruder=extruder), self.assertRaisesRegex(ValueError, "extruder"):
+                afc.parse_lanes(response, units, lane_response, objects)
+
+    def test_invalid_physical_maps_and_membership_are_rejected(self):
+        for mapping in ([], ["T0", "T1"], ["T1"]):
+            response, units, lane_response, objects = fixture()
+            lane_response["result"]["status"][objects["laneA"]]["map"] = mapping
+            with self.subTest(mapping=mapping), self.assertRaises(ValueError):
+                afc.parse_lanes(response, units, lane_response, objects)
+        response, units, lane_response, objects = fixture()
+        next(iter(units.values()))["result"]["status"]["AFC_BoxTurtle Turtle_1"]["lanes"].pop()
+        with self.assertRaisesRegex(ValueError, "Incomplete unit membership"):
+            afc.parse_lanes(response, units, lane_response, objects)
 
     def load_plugin(self):
         fake = types.SimpleNamespace(
@@ -407,7 +441,7 @@ class Tests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "cancelled"):
                 client.apply(lanes, {0: "laneA"}, lambda: True)
             request.assert_not_called()
-            with patch.object(client, "query_lane_maps", return_value=fixture()[3]), patch.object(afc.time, "sleep"):
+            with patch.object(client, "query_lane_maps", return_value=fixture()[2]), patch.object(afc.time, "sleep"):
                 with self.assertRaisesRegex(ValueError, "verification"):
                     client.apply(lanes, {0: "laneA"})
 
