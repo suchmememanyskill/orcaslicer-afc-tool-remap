@@ -32,6 +32,21 @@ def fixture():
     return {"result": {"status": {"AFC": status}}}, units, lane_response, objects
 
 
+def mapping_window():
+    window = types.SimpleNamespace(is_open=lambda: True)
+    window.close = lambda: setattr(window, "is_open", lambda: False)
+    return window
+
+
+def mapping_context(output_name="test.gcode", gcode_path="unused"):
+    return types.SimpleNamespace(output_name=output_name, gcode_path=gcode_path,
+                                 config_value=lambda key: None, cancelled=lambda: False)
+
+
+def mapping_ui(create_window):
+    return types.SimpleNamespace(WINDOW_MODAL=1, create_window=create_window)
+
+
 class Tests(unittest.TestCase):
     def test_join_and_non_four_lane_unit(self):
         lanes = afc.parse_lanes(*fixture())
@@ -196,6 +211,41 @@ class Tests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Incomplete unit membership"):
             afc.parse_lanes(response, units, lane_response, objects)
 
+    def test_fetch_batches_multiple_units(self):
+        response, units, lane_response, objects = fixture()
+        status = response["result"]["status"]["AFC"]
+        status["units"].append("BoxTurtle Turtle_2")
+        unit_status = {
+            "AFC_BoxTurtle Turtle_1": {"lanes": ["laneA"]},
+            "AFC_BoxTurtle Turtle_2": {"lanes": ["laneB", "laneC"]},
+        }
+        client = afc.Moonraker("unused.invalid")
+        with patch.object(client, "request", side_effect=[response,
+                {"result": {"objects": list(objects.values())}},
+                {"result": {"status": unit_status}}, lane_response]) as request:
+            lanes = client.fetch()
+        self.assertEqual(request.call_count, 4)
+        self.assertEqual(request.call_args_list[2].args, (
+            "/printer/objects/query?AFC_BoxTurtle%20Turtle_1&AFC_BoxTurtle%20Turtle_2",))
+        self.assertEqual([(lane["unit"], lane["position"]) for lane in lanes],
+                         [("BoxTurtle Turtle_1", 0), ("BoxTurtle Turtle_2", 0),
+                          ("BoxTurtle Turtle_2", 1)])
+
+    def test_empty_batch_does_not_query_all_printer_objects(self):
+        client = afc.Moonraker("unused.invalid")
+        with patch.object(client, "request") as request:
+            self.assertEqual(client.query_many([]), {"result": {"status": {}}})
+        request.assert_not_called()
+
+    def test_invalid_optional_grams_do_not_block_valid_usage(self):
+        for grams in ("nan", "inf", "-1", "invalid"):
+            text = ("; filament used [mm] = 10\n; filament_type = PLA\n"
+                    "; filament used [g] = " + grams + "\n")
+            with self.subTest(grams=grams), tempfile.NamedTemporaryFile(mode="w") as stream:
+                stream.write(text)
+                stream.flush()
+                self.assertNotIn("grams", afc.project_filaments(stream.name, lambda key: None)[0])
+
     def load_plugin(self):
         fake = types.SimpleNamespace(
             slicing=types.SimpleNamespace(SlicingPipelineCapabilityBase=object,
@@ -262,14 +312,12 @@ class Tests(unittest.TestCase):
         self.assertNotIn('"title": "</script>', injected)
 
     def test_skip_continues_without_printer_commands(self):
-        window = types.SimpleNamespace(is_open=lambda: True)
-        window.close = lambda: setattr(window, "is_open", lambda: False)
+        window = mapping_window()
         def create_window(**kwargs):
             kwargs["on_message"]({"action": "skip"})
             return window
-        ui = types.SimpleNamespace(WINDOW_MODAL=1, create_window=create_window)
-        ctx = types.SimpleNamespace(output_name="part.gcode", gcode_path="unused", config_value=lambda key: None,
-                                    cancelled=lambda: False)
+        ui = mapping_ui(create_window)
+        ctx = mapping_context("part.gcode", "unused")
         client = Mock(mapping_write_attempted=False)
         with patch.object(afc, "project_filaments", return_value=[]), patch.object(afc, "connection", return_value=client):
             self.assertEqual(afc.run_mapping(ctx, ui, threading.Event()), "skipped")
@@ -287,8 +335,7 @@ class Tests(unittest.TestCase):
         self.assertEqual(details["swaps"], 0)
 
     def test_skip_refused_after_write_attempt(self):
-        window = types.SimpleNamespace(is_open=lambda: True)
-        window.close = lambda: setattr(window, "is_open", lambda: False)
+        window = mapping_window()
         def create_window(**kwargs):
             window.post = lambda message: kwargs["on_close"]()
             kwargs["on_message"]({"action": "skip"})
@@ -296,9 +343,8 @@ class Tests(unittest.TestCase):
             return window
         client = Mock(mapping_write_attempted=True)
         client.fetch.side_effect = ValueError("Read failure")
-        ui = types.SimpleNamespace(WINDOW_MODAL=1, create_window=create_window)
-        ctx = types.SimpleNamespace(output_name="test.gcode", gcode_path="unused", config_value=lambda key: None,
-                                    cancelled=lambda: False)
+        ui = mapping_ui(create_window)
+        ctx = mapping_context("test.gcode", "unused")
         with patch.object(afc, "project_filaments", return_value=[]), patch.object(afc, "connection", return_value=client):
             with self.assertRaisesRegex(ValueError, "closed"):
                 afc.run_mapping(ctx, ui, threading.Event())
@@ -307,8 +353,7 @@ class Tests(unittest.TestCase):
 
     def test_live_heartbeats_during_slow_apply(self):
         clock = [0]
-        window = types.SimpleNamespace(is_open=lambda: True)
-        window.close = lambda: setattr(window, "is_open", lambda: False)
+        window = mapping_window()
         def create_window(**kwargs):
             window.message = kwargs["on_message"]
             window.post = lambda message: window.message({"action": "apply", "selection": {"0": "laneA"}})
@@ -320,15 +365,13 @@ class Tests(unittest.TestCase):
             clock[0] = 25
             window.message({"action": "heartbeat"})
         client.apply.side_effect = apply
-        ui = types.SimpleNamespace(WINDOW_MODAL=1, create_window=create_window)
-        ctx = types.SimpleNamespace(output_name="test.gcode", gcode_path="unused", config_value=lambda key: None,
-                                    cancelled=lambda: False)
+        ui = mapping_ui(create_window)
+        ctx = mapping_context("test.gcode", "unused")
         with patch.object(afc, "project_filaments", return_value=[{"tool": 0, "material": "PLA", "color": ""}]), patch.object(afc, "connection", return_value=client), patch.object(afc.time, "monotonic", side_effect=lambda: clock[0]):
             self.assertEqual(afc.run_mapping(ctx, ui, threading.Event()), "applied")
 
     def test_reloaded_page_receives_cached_lanes(self):
-        window = types.SimpleNamespace(is_open=lambda: True)
-        window.close = lambda: setattr(window, "is_open", lambda: False)
+        window = mapping_window()
         replies = []
         def create_window(**kwargs):
             def post(message):
@@ -341,9 +384,8 @@ class Tests(unittest.TestCase):
             return window
         client = Mock(mapping_write_attempted=False)
         client.fetch.return_value = afc.parse_lanes(*fixture())
-        ui = types.SimpleNamespace(WINDOW_MODAL=1, create_window=create_window)
-        ctx = types.SimpleNamespace(output_name="test.gcode", gcode_path="unused", config_value=lambda key: None,
-                                    cancelled=lambda: False)
+        ui = mapping_ui(create_window)
+        ctx = mapping_context("test.gcode", "unused")
         with patch.object(afc, "project_filaments", return_value=[]), patch.object(afc, "connection", return_value=client):
             with self.assertRaisesRegex(ValueError, "closed"):
                 afc.run_mapping(ctx, ui, threading.Event())
@@ -355,8 +397,7 @@ class Tests(unittest.TestCase):
         fresh = [dict(lane, color="#fedcba") for lane in initial]
         client = Mock(mapping_write_attempted=False)
         client.fetch.side_effect = [initial, fresh]
-        window = types.SimpleNamespace(is_open=lambda: True)
-        window.close = lambda: setattr(window, "is_open", lambda: False)
+        window = mapping_window()
         replies = []
         def create_window(**kwargs):
             def post(message):
@@ -366,9 +407,8 @@ class Tests(unittest.TestCase):
             window.post = post
             kwargs["on_message"]({"action": "ready"})
             return window
-        ctx = types.SimpleNamespace(output_name="test.gcode", gcode_path="unused", config_value=lambda key: None,
-                                    cancelled=lambda: False)
-        ui = types.SimpleNamespace(WINDOW_MODAL=1, create_window=create_window)
+        ctx = mapping_context("test.gcode", "unused")
+        ui = mapping_ui(create_window)
         with patch.object(afc, "project_filaments", return_value=[{"tool": 0, "material": "PLA", "color": ""}]), patch.object(afc, "connection", return_value=client):
             self.assertEqual(afc.run_mapping(ctx, ui, threading.Event()), "applied")
         self.assertEqual(client.fetch.call_count, 2)
@@ -379,8 +419,7 @@ class Tests(unittest.TestCase):
     def test_refresh_can_recover_from_read_error_without_writes(self):
         client = Mock(mapping_write_attempted=False)
         client.fetch.side_effect = [ValueError("temporary read failure"), afc.parse_lanes(*fixture())]
-        window = types.SimpleNamespace(is_open=lambda: True)
-        window.close = lambda: setattr(window, "is_open", lambda: False)
+        window = mapping_window()
         kinds = []
         def create_window(**kwargs):
             def post(message):
@@ -392,9 +431,8 @@ class Tests(unittest.TestCase):
             window.post = post
             kwargs["on_message"]({"action": "ready"})
             return window
-        ctx = types.SimpleNamespace(output_name="test.gcode", gcode_path="unused", config_value=lambda key: None,
-                                    cancelled=lambda: False)
-        ui = types.SimpleNamespace(WINDOW_MODAL=1, create_window=create_window)
+        ctx = mapping_context("test.gcode", "unused")
+        ui = mapping_ui(create_window)
         with patch.object(afc, "project_filaments", return_value=[]), patch.object(afc, "connection", return_value=client):
             with self.assertRaisesRegex(ValueError, "closed"):
                 afc.run_mapping(ctx, ui, threading.Event())
@@ -405,16 +443,14 @@ class Tests(unittest.TestCase):
     def test_refresh_refused_after_mapping_write_attempt(self):
         client = Mock(mapping_write_attempted=True)
         client.fetch.side_effect = ValueError("read error")
-        window = types.SimpleNamespace(is_open=lambda: True)
-        window.close = lambda: setattr(window, "is_open", lambda: False)
+        window = mapping_window()
         def create_window(**kwargs):
             window.post = lambda message: kwargs["on_close"]()
             kwargs["on_message"]({"action": "refresh"})
             kwargs["on_message"]({"action": "ready"})
             return window
-        ctx = types.SimpleNamespace(output_name="test.gcode", gcode_path="unused", config_value=lambda key: None,
-                                    cancelled=lambda: False)
-        ui = types.SimpleNamespace(WINDOW_MODAL=1, create_window=create_window)
+        ctx = mapping_context("test.gcode", "unused")
+        ui = mapping_ui(create_window)
         with patch.object(afc, "project_filaments", return_value=[]), patch.object(afc, "connection", return_value=client):
             with self.assertRaisesRegex(ValueError, "closed"):
                 afc.run_mapping(ctx, ui, threading.Event())
@@ -469,9 +505,8 @@ class Tests(unittest.TestCase):
                 window.post = post
                 kwargs["on_message"]({"action": "ready"})
                 return window
-            ctx = types.SimpleNamespace(output_name="test.gcode", gcode_path="unused", config_value=lambda key: None,
-                                        cancelled=lambda: False)
-            ui = types.SimpleNamespace(WINDOW_MODAL=1, create_window=create_window)
+            ctx = mapping_context("test.gcode", "unused")
+            ui = mapping_ui(create_window)
             with patch.object(afc, "project_filaments", return_value=[]), patch.object(afc, "connection", return_value=client):
                 self.assertEqual(afc.run_mapping(ctx, ui, threading.Event()), "skipped")
             self.assertEqual(notices, ["network_permission"] if skip else ["network_permission", "network_permission", "lanes"])
@@ -546,9 +581,8 @@ class Tests(unittest.TestCase):
                 window.close = lambda: setattr(window, "is_open", lambda: False)
                 kwargs["on_message"]({"action": "ready"})
                 return window
-            ui = types.SimpleNamespace(WINDOW_MODAL=1, create_window=create_window)
-            ctx = types.SimpleNamespace(output_name="test.gcode", gcode_path="unused", config_value=lambda key: None,
-                                        cancelled=lambda: False)
+            ui = mapping_ui(create_window)
+            ctx = mapping_context("test.gcode", "unused")
             client = Mock(mapping_write_attempted=attempted)
             client.fetch.side_effect = ValueError("Example failure")
             with patch.object(afc, "project_filaments", return_value=[]), patch.object(afc, "connection", return_value=client):
@@ -561,8 +595,7 @@ class Tests(unittest.TestCase):
     def test_ui_starvation_has_bounded_exit(self):
         window = types.SimpleNamespace(is_open=lambda: True, close=lambda: None)
         ui = types.SimpleNamespace(WINDOW_MODAL=1, create_window=lambda **kwargs: window)
-        ctx = types.SimpleNamespace(output_name="part.gcode", gcode_path="unused", config_value=lambda key: None,
-                                    cancelled=lambda: False)
+        ctx = mapping_context("part.gcode", "unused")
         # Simulate a GUI which never services the queued window creation.
         times = iter([0, 21, 21, 24])
         with patch.object(afc, "project_filaments", return_value=[]), patch.object(afc, "connection"), patch.object(afc.time, "monotonic", side_effect=lambda: next(times)):
@@ -571,8 +604,7 @@ class Tests(unittest.TestCase):
 
     def test_mapping_ui_happy_flow_and_close(self):
         # Fake only the UI bridge and HTTP client, exercising the actual event loop.
-        ctx = types.SimpleNamespace(output_name="part.gcode", gcode_path="working-copy",
-                                    config_value=lambda key: None, cancelled=lambda: False)
+        ctx = mapping_context("part.gcode", "working-copy")
         lanes = afc.parse_lanes(*fixture())
         for apply in (True, False):
             class Window:
@@ -588,7 +620,7 @@ class Tests(unittest.TestCase):
                 window.message, window.closed = kwargs["on_message"], kwargs["on_close"]
                 kwargs["on_message"]({"action": "ready"})
                 return window
-            ui = types.SimpleNamespace(WINDOW_MODAL=1, create_window=create_window)
+            ui = mapping_ui(create_window)
             with patch.object(afc, "project_filaments", return_value=[{"tool": 0, "material": "PLA", "color": "#123456"}]), patch.object(afc, "connection") as connect:
                 connect.return_value.fetch.return_value = lanes
                 if apply:

@@ -4,7 +4,7 @@
 # name = "AFC tool remap"
 # description = "Review physical AFC lane assignments before Orca uploads G-code."
 # author = "Sims"
-# version = "0.3.20"
+# version = "0.3.21"
 # type = "slicing-pipeline"
 # ///
 """Orca 2.5 experimental AFC tool remap mapping. No uploader or G-code edits.
@@ -55,15 +55,15 @@ def discover_lane_objects(names, response):
     objects = response["result"]["objects"]
     if not isinstance(objects, list) or any(not isinstance(obj, str) for obj in objects):
         raise ValueError("Invalid printer object list")
-    resolved = {}
+    by_name = {}
+    for obj in objects:
+        kind, _, name = obj.partition(" ")
+        if kind in ("AFC_stepper", "AFC_lane"):
+            by_name.setdefault(name, obj)
     for name in names:
-        matches = [obj for obj in objects
-                   if obj.partition(" ")[0] in ("AFC_stepper", "AFC_lane")
-                   and obj.partition(" ")[2] == name]
-        if not matches:
+        if name not in by_name:
             raise ValueError(f"Missing AFC lane object for {name}")
-        resolved[name] = matches[0]
-    return resolved
+    return {name: by_name[name] for name in names}
 
 
 def parse_lanes(afc, units, lane_response, objects):
@@ -77,11 +77,13 @@ def parse_lanes(afc, units, lane_response, objects):
     current = physical_lane_tools(objects, lane_response)
     extruders = set()
     lanes = []
+    seen = set()
     for section in status["units"]:
         obj = "AFC_" + section
         for position, name in enumerate(units[obj]["result"]["status"][obj]["lanes"]):
-            if name not in current or any(lane["name"] == name for lane in lanes):
+            if name not in current or name in seen:
                 raise ValueError("Invalid unit membership")
+            seen.add(name)
             record = lane_response["result"]["status"][objects[name]]
             extruder = record.get("extruder")
             if not isinstance(extruder, str) or not extruder.strip():
@@ -172,20 +174,26 @@ class Moonraker:
             raise ValueError("Moonraker returned an error")
         return result
 
+    def query_many(self, objects):
+        objects = list(objects)
+        if not objects:
+            return {"result": {"status": {}}}
+        return self.request("/printer/objects/query?" + "&".join(
+            quote(obj, safe="") for obj in objects))
+
     def query(self, obj):
-        return self.request("/printer/objects/query?" + quote(obj, safe=""))
+        return self.query_many([obj])
 
     def query_lane_maps(self, objects):
-        # Query all physical lane objects in one request, including their map lists.
-        return self.request("/printer/objects/query?" + "&".join(
-            quote(obj, safe="") for obj in objects.values()))
+        return self.query_many(objects.values())
 
     def fetch(self):
         afc = self.query("AFC")
         objects = discover_lane_objects(afc["result"]["status"]["AFC"]["lanes"],
                                         self.request("/printer/objects/list"))
-        units = {"AFC_" + section: self.query("AFC_" + section)
-                 for section in afc["result"]["status"]["AFC"]["units"]}
+        unit_names = ["AFC_" + section for section in afc["result"]["status"]["AFC"]["units"]]
+        unit_response = self.query_many(unit_names)
+        units = dict.fromkeys(unit_names, unit_response)
         lane_response = self.query_lane_maps(objects)
         return parse_lanes(afc, units, lane_response, objects)
 
@@ -207,10 +215,10 @@ class Moonraker:
             payload = {"script": "\n".join(commands)}
             self.mapping_write_attempted = True
             self.request("/printer/gcode/script", payload)
+        objects = {lane["name"]: lane["object"] for lane in fresh}
         for attempt in range(6):
             if cancelled():
                 raise ValueError("Send cancelled; mapping may already have changed")
-            objects = {lane["name"]: lane["object"] for lane in fresh}
             current = physical_lane_tools(objects, self.query_lane_maps(objects))
             actual = {tool: name for name, tool in current.items()}
             if actual == expected:
@@ -225,6 +233,13 @@ def profile_values(value):
     if not value:
         return []
     return next(csv.reader([str(value)], delimiter=";", skipinitialspace=True))
+
+
+def usage_values(text):
+    values = [float(x.strip()) for x in text.split(",") if x.strip()]
+    if any(not math.isfinite(x) or x < 0 for x in values):
+        raise ValueError("Invalid filament usage")
+    return values
 
 
 def project_filaments(path, get, details=None):
@@ -269,8 +284,11 @@ def project_filaments(path, get, details=None):
                 else:
                     collecting = None
     usage_text = stats.get("filament used [mm]", stats.get("filament used [g]", ""))
-    usage = [float(x.strip()) for x in usage_text.split(",") if x.strip()]
-    if not usage or any(not math.isfinite(x) or x < 0 for x in usage):
+    try:
+        usage = usage_values(usage_text)
+    except ValueError:
+        usage = []
+    if not usage:
         raise ValueError("Missing or invalid filament usage statistics; re-slice the plate")
     types = profile_values(stats.get("filament_type") or get("filament_type"))
     colors = profile_values(stats.get("filament_colour") or get("filament_colour"))
@@ -279,9 +297,7 @@ def project_filaments(path, get, details=None):
         raise ValueError("G-code tools disagree with filament usage; check the printer macros")
     grams = []
     try:
-        grams = [float(x.strip()) for x in stats.get("filament used [g]", "").split(",") if x.strip()]
-        if any(not math.isfinite(x) or x < 0 for x in grams):
-            grams = []
+        grams = usage_values(stats.get("filament used [g]", ""))
     except ValueError:
         pass
     result = []
@@ -399,23 +415,17 @@ def run_mapping(ctx, ui, stopped):
             try:
                 if action == "skip" and not client.mapping_write_attempted:
                     return "skipped"
-                if action == "refresh" and not client.mapping_write_attempted:
-                    if not authorize_network():
-                        continue
-                    client.ensure_idle()
-                    lanes = client.fetch()
-                    last_error = None
-                    window.post({"kind": "lanes", "lanes": lanes})
-                elif action == "ready":
-                    if last_error is not None:
+                if action == "ready" or (action == "refresh" and not client.mapping_write_attempted):
+                    if action == "ready" and last_error is not None:
                         window.post(last_error)
-                    else:
-                        if lanes is None:
-                            if not authorize_network():
-                                continue
-                            client.ensure_idle()
-                            lanes = client.fetch()
-                        window.post({"kind": "lanes", "lanes": lanes})
+                        continue
+                    if action == "refresh" or lanes is None:
+                        if not authorize_network():
+                            continue
+                        client.ensure_idle()
+                        lanes = client.fetch()
+                        last_error = None
+                    window.post({"kind": "lanes", "lanes": lanes})
                 elif action == "apply" and lanes is not None and last_error is None:
                     selection = validate_selection(filaments, lanes, message.get("selection"))
                     client.apply(lanes, selection, cancelled)
