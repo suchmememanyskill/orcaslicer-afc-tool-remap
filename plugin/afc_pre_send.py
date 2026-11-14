@@ -4,7 +4,7 @@
 # name = "AFC tool remap"
 # description = "Review physical AFC lane assignments before Orca uploads G-code."
 # author = "Sims"
-# version = "0.3.18"
+# version = "0.3.20"
 # type = "slicing-pipeline"
 # ///
 """Orca 2.5 experimental AFC tool remap mapping. No uploader or G-code edits.
