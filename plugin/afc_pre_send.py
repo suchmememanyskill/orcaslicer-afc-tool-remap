@@ -444,8 +444,6 @@ if orca is not None and hasattr(orca, "slicing"):
             if ctx.step != orca.slicing.Step.psGCodePostProcess or ctx.host != "Moonraker":
                 return orca.ExecutionResult.success()
             try:
-                if not re.fullmatch(r"v?2\.5\.0(?:-rc)?", ctx.orca_version):
-                    raise ValueError("AFC tool remap requires OrcaSlicer 2.5.0")
                 if not ctx.output_name.lower().endswith(".gcode"):
                     raise ValueError("AFC tool remap supports only .gcode sends")
                 outcome = run_mapping(ctx, orca.host.ui, self.stopped)
